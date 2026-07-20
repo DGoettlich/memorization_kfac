@@ -28,13 +28,18 @@ TIME_LOCK_REVISION = "cd0f0bc323ae471028562d034e7c3c67bc7d6077"
 CHOICE_MARKER = "<|CHOICE|>"
 DEFAULT_LAYERS = [20, 24, 28, 32, 35]
 DEFAULT_PROJECTIONS = ["gate", "up", "down"]
+WELLINGTON_QUESTION = (
+    "What was the name of the battle where Napoleon was defeated by "
+    "the Duke of Wellington? Answer:"
+)
+WELLINGTON_CHOICES = [" Waterloo", " Austerlitz", " Leipzig", " Trafalgar"]
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=["build_cache", "time_lock"],
+        choices=["build_cache", "time_lock", "wellington"],
         required=True,
     )
     parser.add_argument("--model", default=MODEL_ID)
@@ -357,6 +362,46 @@ def run_time_lock(args, model, tokenizer, originals):
     return all_rows, summarize_time_lock(all_rows, args)
 
 
+def run_wellington(args, model, tokenizer, originals):
+    pairs = [
+        encode_pair(tokenizer, WELLINGTON_QUESTION, choice)
+        for choice in WELLINGTON_CHOICES
+    ]
+    rows = []
+    for condition, rho, alpha in conditions(args):
+        apply_condition(model, args, originals, rho, alpha)
+        scores = score_encoded_pairs(
+            model, pairs, args.batch_size, tokenizer.pad_token_id
+        )
+        probabilities = torch.softmax(torch.tensor(scores), dim=0)
+        prompt = tokenizer(WELLINGTON_QUESTION, return_tensors="pt").to(model.device)
+        with torch.inference_mode():
+            output = model.generate(
+                **prompt,
+                do_sample=False,
+                max_new_tokens=16,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        generated = tokenizer.decode(
+            output[0, prompt.input_ids.shape[1] :], skip_special_tokens=True
+        )
+        rows.append(
+            {
+                "condition": condition,
+                "rho": rho,
+                "alpha": alpha,
+                "question": WELLINGTON_QUESTION,
+                "choices": [choice.strip() for choice in WELLINGTON_CHOICES],
+                "choice_loglikelihoods": scores,
+                "choice_probabilities": probabilities.tolist(),
+                "p_correct": float(probabilities[0]),
+                "prediction": WELLINGTON_CHOICES[int(probabilities.argmax())].strip(),
+                "generated": generated,
+            }
+        )
+    return rows, {row["condition"]: row["p_correct"] for row in rows}
+
+
 def write_outputs(args, rows, summary):
     args.results_dir.mkdir(parents=True, exist_ok=True)
     rows_path = args.results_dir / f"{args.mode}.jsonl"
@@ -393,7 +438,10 @@ def main():
         return
 
     originals = original_weights(model, args)
-    rows, summary = run_time_lock(args, model, tokenizer, originals)
+    if args.mode == "time_lock":
+        rows, summary = run_time_lock(args, model, tokenizer, originals)
+    else:
+        rows, summary = run_wellington(args, model, tokenizer, originals)
 
     apply_condition(model, args, originals, None, 0.0)
     write_outputs(args, rows, summary)
