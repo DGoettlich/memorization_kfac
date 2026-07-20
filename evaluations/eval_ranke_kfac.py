@@ -103,7 +103,7 @@ def load_model_and_tokenizer(args):
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         revision=args.revision,
-        torch_dtype=dtype,
+        dtype=dtype,
         device_map={"": args.device},
         trust_remote_code=True,
     ).eval()
@@ -297,6 +297,7 @@ def run_time_lock(args, model, tokenizer, originals):
         TIME_LOCK_ID,
         split="train",
         revision=TIME_LOCK_REVISION,
+        verification_mode="no_checks",
     )
     documents = list(dataset)
     if args.limit:

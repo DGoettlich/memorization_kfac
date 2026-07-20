@@ -344,7 +344,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         revision=args.revision,
-        torch_dtype=dtype,
+        dtype=dtype,
         device_map={"": args.device},
         trust_remote_code=True,
     )
