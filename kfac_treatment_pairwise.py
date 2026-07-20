@@ -548,3 +548,127 @@ class KFACTreatmentPairwise(KFACTreatment):
                     'col0_pairs': int(info.get('col0_pairs', 0)),
                     'full_block_J': int(info.get('full_block_J', 0)),
                 }
+
+
+class KFACAmplificationPairwise(KFACTreatmentPairwise):
+    """Expose and amplify the low-curvature complement of a pairwise edit."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.amplification_stats = {}
+
+    @staticmethod
+    def _validate_and_clamp_eigenvalues(
+        eigenvalues: torch.Tensor, layer_name: str, factor_name: str
+    ) -> torch.Tensor:
+        if not torch.isfinite(eigenvalues).all():
+            raise FloatingPointError(
+                f"Non-finite {factor_name} eigenvalues for {layer_name}"
+            )
+        scale = max(float(eigenvalues.abs().max()), 1e-30)
+        minimum = float(eigenvalues.min())
+        if minimum < -1e-4 * scale:
+            raise ValueError(
+                f"{factor_name} for {layer_name} is not numerically PSD: "
+                f"min={minimum:.3e}, scale={scale:.3e}"
+            )
+        return eigenvalues.clamp_min(0)
+
+    def _low_component(self, layer_name: str, rho: float):
+        if not 0.0 < rho <= 1.0:
+            raise ValueError(f"rho must be in (0, 1], got {rho}")
+
+        info = self.kfac_info[layer_name]
+        eigenvalues_G = self._validate_and_clamp_eigenvalues(
+            info["eva_G"].to(self.device), layer_name, "G"
+        )
+        eigenvalues_A = self._validate_and_clamp_eigenvalues(
+            info["eva_A"].to(self.device), layer_name, "A"
+        )
+        eigenvectors_G = info["evc_G"].to(self.device)
+        eigenvectors_A = info["evc_A"].to(self.device)
+        weight = info["W_orig"].float().to(self.device)
+
+        products = eigenvalues_G[:, None] * eigenvalues_A[None, :]
+        flat_products = products.flatten()
+        total_mass = flat_products.sum()
+        if not torch.isfinite(total_mass) or total_mass <= 0:
+            raise ValueError(f"Non-positive joint K-FAC mass for {layer_name}")
+
+        sorted_products, sorted_indices = torch.sort(
+            flat_products, descending=True
+        )
+        cumulative_mass = torch.cumsum(sorted_products, dim=0)
+        target_mass = rho * total_mass
+        selected_count = int(torch.searchsorted(cumulative_mass, target_mass)) + 1
+        selected_count = min(selected_count, flat_products.numel())
+
+        coefficients = eigenvectors_G.T @ weight @ eigenvectors_A
+        top_coefficients = torch.zeros_like(coefficients)
+        top_coefficients.flatten()[sorted_indices[:selected_count]] = (
+            coefficients.flatten()[sorted_indices[:selected_count]]
+        )
+        top_weight = eigenvectors_G @ top_coefficients @ eigenvectors_A.T
+        low_weight = weight - top_weight
+
+        actual_mass = cumulative_mass[selected_count - 1] / total_mass
+        weight_norm = torch.linalg.vector_norm(weight).clamp_min(1e-30)
+        relative_low_norm = torch.linalg.vector_norm(low_weight) / weight_norm
+        suppression_error = torch.linalg.vector_norm(
+            (weight - low_weight) - top_weight
+        ) / weight_norm
+        stats = {
+            "rho": float(rho),
+            "selected_pairs": selected_count,
+            "total_pairs": flat_products.numel(),
+            "pair_ratio": selected_count / flat_products.numel(),
+            "mass_ratio": float(actual_mass),
+            "relative_low_norm": float(relative_low_norm),
+            "suppression_error": float(suppression_error),
+        }
+        if stats["suppression_error"] >= 5e-4:
+            raise RuntimeError(
+                f"Suppression reconstruction failed for {layer_name}: {stats}"
+            )
+        return low_weight, stats
+
+    def compute_low_curvature_components(
+        self, variance_ratio: Union[float, Dict[str, float]]
+    ) -> Dict[str, torch.Tensor]:
+        if isinstance(variance_ratio, (float, int)):
+            ratio_map = {
+                name: float(variance_ratio) for name in self.layer_names
+            }
+        else:
+            ratio_map = variance_ratio
+
+        low_components = {}
+        with torch.no_grad():
+            for layer_name in self.layer_names:
+                low_weight, stats = self._low_component(
+                    layer_name, float(ratio_map[layer_name])
+                )
+                low_components[layer_name] = low_weight
+                self.amplification_stats[layer_name] = stats
+        return low_components
+
+    def apply_amplification(
+        self,
+        variance_ratio: Union[float, Dict[str, float]],
+        alpha: float,
+        low_components: Optional[Dict[str, torch.Tensor]] = None,
+    ):
+        if low_components is None:
+            low_components = self.compute_low_curvature_components(variance_ratio)
+
+        with torch.no_grad():
+            for layer_name in self.layer_names:
+                layer = self._get_layer_by_name(layer_name)
+                original = self.original_weights[layer_name].float().to(layer.weight.device)
+                low_weight = low_components[layer_name].float().to(layer.weight.device)
+                edited = original + float(alpha) * low_weight
+                if not torch.isfinite(edited).all():
+                    raise FloatingPointError(
+                        f"Non-finite amplified weight for {layer_name}"
+                    )
+                layer.weight.copy_(edited.to(layer.weight.dtype))

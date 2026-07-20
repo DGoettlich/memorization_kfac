@@ -1,0 +1,10 @@
+[project]
+name = "memorization-kfac"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets<5.0",
+]
+
+[tool.uv]
+constraint-dependencies = ["huggingface-hub<1.0"]
