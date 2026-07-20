@@ -23,6 +23,7 @@ EXPECTED_HIDDEN_SIZE = 2560
 EXPECTED_INTERMEDIATE_SIZE = 9728
 EXPECTED_LAYERS = 36
 PROJECTION_NAMES = ("gate", "up", "down")
+DEFAULT_TARGET_BLOCKS = [20, 24, 28, 32, 35]
 
 
 def parse_args():
@@ -36,7 +37,9 @@ def parse_args():
     parser.add_argument("--seq_len", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--n_tokens", type=int, default=32_768)
-    parser.add_argument("--target_blocks", type=int, nargs="+", required=True)
+    parser.add_argument(
+        "--target_blocks", type=int, nargs="+", default=DEFAULT_TARGET_BLOCKS
+    )
     parser.add_argument(
         "--projections",
         nargs="+",
@@ -51,7 +54,6 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=1913)
     parser.add_argument("--sample_labels", action="store_true")
     parser.add_argument("--char_offset", type=int, default=20_000)
-    parser.add_argument("--max_windows_per_book", type=int, default=8)
     return parser.parse_args()
 
 
@@ -69,13 +71,11 @@ class GutenbergKFACStream(IterableDataset):
         seq_len: int,
         n_tokens: int,
         char_offset: int,
-        max_windows_per_book: int,
     ):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.n_tokens = n_tokens
         self.char_offset = char_offset
-        self.max_windows_per_book = max_windows_per_book
 
     def _rows(self):
         return load_dataset(
@@ -87,30 +87,29 @@ class GutenbergKFACStream(IterableDataset):
 
     def __iter__(self):
         emitted = 0
+        seen_book_ids = set()
         for row in self._rows():
             book_id = str(row["id"])
-            if book_bucket(book_id) > 7:
+            if book_bucket(book_id) > 7 or book_id in seen_book_ids:
                 continue
+            seen_book_ids.add(book_id)
 
             text = row["text"][self.char_offset :]
             token_ids = self.tokenizer(
                 text, add_special_tokens=False, return_attention_mask=False
             ).input_ids
-            available = min(
-                len(token_ids) // self.seq_len, self.max_windows_per_book
-            )
-            for window_index in range(available):
-                start = window_index * self.seq_len
-                if emitted + self.seq_len > self.n_tokens:
-                    return
-                yield {
-                    "input_ids": token_ids[start : start + self.seq_len],
-                    "book_id": book_id,
-                    "token_offset": start,
-                }
-                emitted += self.seq_len
-                if emitted >= self.n_tokens:
-                    return
+            if len(token_ids) < self.seq_len:
+                continue
+            if emitted + self.seq_len > self.n_tokens:
+                return
+            yield {
+                "input_ids": token_ids[: self.seq_len],
+                "book_id": book_id,
+                "token_offset": 0,
+            }
+            emitted += self.seq_len
+            if emitted >= self.n_tokens:
+                return
 
 
 class KFACCollector:
@@ -235,7 +234,6 @@ def collect_block(args, model, tokenizer, block: int):
         seq_len=args.seq_len,
         n_tokens=args.n_tokens,
         char_offset=args.char_offset,
-        max_windows_per_book=args.max_windows_per_book,
     )
     loader = DataLoader(
         stream,
@@ -284,6 +282,10 @@ def collect_block(args, model, tokenizer, block: int):
             f"Gutenberg stream ended after {processed} tokens; requested {args.n_tokens}"
         )
 
+    book_ids = [window["id"] for window in seen_books]
+    if len(book_ids) != len(set(book_ids)):
+        raise RuntimeError("K-FAC stream sampled a Gutenberg book more than once")
+
     factors = {}
     diagnostics = {}
     for name, collector in collectors.items():
@@ -317,6 +319,8 @@ def collect_block(args, model, tokenizer, block: int):
         "seq_len": args.seq_len,
         "requested_tokens": args.n_tokens,
         "processed_tokens": processed,
+        "unique_books": len(book_ids),
+        "windows_per_book": 1,
         "sample_labels": args.sample_labels,
         "seed": args.seed,
         "windows": seen_books,
