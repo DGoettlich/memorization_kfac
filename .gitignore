@@ -1,1 +1,7 @@
 data/pile10k_None.txt
+.venv/
+__pycache__/
+*.pyc
+assets/kfac_factors/ranke_4b_1913/
+cache/kfac_weights/ranke_4b_1913/
+results/ranke_4b_1913/
